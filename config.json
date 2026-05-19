@@ -1,0 +1,13 @@
+{
+  "pools": {
+    "sirens":  true,
+    "lights":  true,
+    "modkits": true
+  },
+
+  "ignore": [],
+
+  "backup":  true,
+  "dryRun":  false,
+  "report":  "pretty"
+}

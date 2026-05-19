@@ -1,0 +1,24 @@
+{
+  "name": "carcols-id-fixer",
+  "version": "0.1.0",
+  "description": "Detects and fixes sirenSettings, lightSettings, and modKit ID overlaps across FiveM carcols.meta and carvariations.meta files.",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "carcols-id-fixer": "index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CFX-Software/carcols-id-fixer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CFX-Software/carcols-id-fixer/issues"
+  },
+  "homepage": "https://github.com/CFX-Software/carcols-id-fixer#readme",
+  "keywords": ["fivem", "gta5", "carcols", "carvariations", "modkit", "siren", "lightbar", "fxserver"],
+  "author": "CFX-Software",
+  "license": "MIT"
+}
