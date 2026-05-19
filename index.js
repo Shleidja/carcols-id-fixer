@@ -5,16 +5,22 @@ import path from 'node:path';
 const VERSION = '0.1.0';
 
 // Pool ranges:
-//   siren / light:  vanilla GTA V cap (0-255). FiveM has not raised this.
-//   modkit:         FiveM bumped vanilla 0-1023 to 0-65535 via
-//                   citizenfx/fivem ModKitIdRelocation.cpp
-//                   (constexpr int NUM_MODKIT_INDICES = 65536).
+//   siren / light: vanilla GTA V cap is 0-255. FiveM has not raised this
+//                  server-side. Client-side, SirenSetting Limit Adjuster
+//                  (SSLA, by cp702) raises the siren ID cap to 65535 with
+//                  three reserved values: 0, 255, 65535. Enable via
+//                  `sirenLimitAdjuster: true` in config.json or `--ssla`.
+//   modkit:        FiveM bumped vanilla 0-1023 to 0-65535 via
+//                  citizenfx/fivem ModKitIdRelocation.cpp
+//                  (constexpr int NUM_MODKIT_INDICES = 65536).
 const POOLS = {
-  siren:  { min: 1, max: 255,   label: 'sirenSettings' },
+  siren:  { min: 1, max: 254,   label: 'sirenSettings' },
   light:  { min: 1, max: 255,   label: 'lightSettings' },
   modkit: { min: 1, max: 65535, label: 'modKit' },
 };
-const PROTECTED = { siren: new Set(), light: new Set(), modkit: new Set([0]) };
+const SSLA_SIREN_MAX = 65534;        // SSLA raises cap, but 65535 is reserved
+const SSLA_RESERVED  = new Set([0, 255, 65535]);
+const PROTECTED = { siren: new Set([0]), light: new Set([0]), modkit: new Set([0]) };
 const TARGET_FILES = new Set(['carcols.meta', 'carvariations.meta']);
 const SKIP_DIRS = new Set(['node_modules', '.git', '.svn', '.hg', '.cache']);
 
@@ -24,6 +30,7 @@ const DEFAULTS = {
   backup: true,
   dryRun: false,
   report: 'pretty',
+  sirenLimitAdjuster: false,
 };
 
 // Hard-coded — CarcolsPatcher folder lives next to server.cfg, sibling to resources/.
@@ -51,6 +58,7 @@ async function loadConfig(dir) {
     backup: parsed.backup ?? DEFAULTS.backup,
     dryRun: parsed.dryRun ?? DEFAULTS.dryRun,
     report: parsed.report ?? DEFAULTS.report,
+    sirenLimitAdjuster: parsed.sirenLimitAdjuster ?? DEFAULTS.sirenLimitAdjuster,
     _path: p,
   };
 }
@@ -68,7 +76,18 @@ function mergeOpts(config, cli) {
     quiet:   cli.quiet ?? (config.report === 'quiet'),
     maxList: cli.maxList ?? 25,
     ignore:  config.ignore || [],
+    ssla:    pick(cli.ssla, config.sirenLimitAdjuster),
   };
+}
+
+function effectivePools(opts) {
+  const out = {
+    siren:  { ...POOLS.siren },
+    light:  { ...POOLS.light },
+    modkit: { ...POOLS.modkit },
+  };
+  if (opts.ssla) out.siren.max = SSLA_SIREN_MAX;
+  return out;
 }
 
 function resolveResourcesDir(configPath) {
@@ -260,26 +279,38 @@ function pickFreeId(pool, used) {
 }
 
 function planReassignments(pools, conflicts, opts) {
+  const eff = effectivePools(opts);
   const used = {
     siren:  new Set(pools.siren.keys()),
     light:  new Set(pools.light.keys()),
     modkit: new Set(pools.modkit.keys()),
   };
-  const plan = { siren: [], light: [], modkit: [] };
+  // Lock reserved values out of the picker.
+  if (opts.ssla) for (const v of SSLA_RESERVED) used.siren.add(v);
+  for (const v of PROTECTED.siren)  used.siren.add(v);
+  for (const v of PROTECTED.light)  used.light.add(v);
+  for (const v of PROTECTED.modkit) used.modkit.add(v);
+
+  const plan       = { siren: [], light: [], modkit: [] };
+  const unfixable  = { siren: [], light: [], modkit: [] };
+
   for (const key of ['siren', 'light', 'modkit']) {
     if (!opts[key]) continue;
     for (const conflict of conflicts[key]) {
       const sorted = [...conflict.entries].sort((a, b) => a.file.localeCompare(b.file));
       for (let i = 1; i < sorted.length; i++) {
         const e = sorted[i];
-        const newId = pickFreeId(POOLS[key], used[key]);
-        if (newId === null) throw new Error(`Pool ${key} exhausted (range ${POOLS[key].min}-${POOLS[key].max}).`);
+        const newId = pickFreeId(eff[key], used[key]);
+        if (newId === null) {
+          unfixable[key].push({ from: e.id, entry: e, kitName: e.kitName });
+          continue;
+        }
         used[key].add(newId);
         plan[key].push({ from: e.id, to: newId, entry: e, kitName: e.kitName });
       }
     }
   }
-  return plan;
+  return { plan, unfixable, eff };
 }
 
 async function applyPlan({ files, plan, varRefsByKitName, backup, dryRun }) {
@@ -379,13 +410,19 @@ FLAGS
   --max-list <N>                 trim per-pool tables (default 25)
   -h, --help    -v, --version
 
+  --ssla / --no-ssla             enable SirenSetting Limit Adjuster mode
+                                  (raises siren cap from 254 to 65534,
+                                  client mod required: gta5-mods.com/scripts
+                                  /sirensetting-limit-adjuster)
+
 CONFIG (config.json, optional)
   {
     "pools":   { "sirens": true, "lights": true, "modkits": true },
     "ignore":  [],
     "backup":  true,
     "dryRun":  false,
-    "report":  "pretty"
+    "report":  "pretty",
+    "sirenLimitAdjuster": false
   }
 
 Place this folder next to server.cfg. \`../resources\` is read automatically.`;
@@ -412,6 +449,9 @@ function parseArgs(argv) {
       case '--json':      out.json = true; break;
       case '--quiet':     out.quiet = true; break;
       case '--max-list':  out.maxList = parseInt(argv[++i] || '25', 10); break;
+      case '--ssla':                  out.ssla = true; break;
+      case '--no-ssla':               out.ssla = false; break;
+      case '--siren-limit-adjuster':  out.ssla = true; break;
       default:
         if (a.startsWith('--')) { errOut(`unknown flag: ${a}`); process.exit(2); }
         positional.push(a);
@@ -531,9 +571,13 @@ async function cmdFix(root, opts, config) {
   }
   if (sN + lN + mN === 0) { ok('nothing to patch'); return; }
 
-  const plan = planReassignments(idx.pools, conflicts, opts);
+  const { plan, unfixable, eff } = planReassignments(idx.pools, conflicts, opts);
   const total = plan.siren.length + plan.light.length + plan.modkit.length;
+  const unfixTotal = unfixable.siren.length + unfixable.light.length + unfixable.modkit.length;
   if (!opts.quiet) step('plan',  `${C.cyan(total)} id reassignments queued`);
+  if (unfixTotal > 0 && !opts.quiet) {
+    step('error', `${C.red(unfixTotal)} unfixable · pool exhausted`);
+  }
 
   const result = await applyPlan({
     files: idx.files, plan, varRefsByKitName: idx.varRefsByKitName,
@@ -557,10 +601,46 @@ async function cmdFix(root, opts, config) {
         modkit: plan.modkit.map((p) => slim(p, root)),
       },
       filesWritten: result.written, dryRun: !!opts.dry,
+      unfixable: {
+        siren:  unfixable.siren.map((u) => slim(u, root)),
+        light:  unfixable.light.map((u) => slim(u, root)),
+        modkit: unfixable.modkit.map((u) => slim(u, root)),
+      },
     }, null, 2) + '\n');
     return;
   }
+  if (unfixTotal > 0) {
+    process.stdout.write('\n');
+    errOut(`POOL LIMIT REACHED — ${unfixTotal} overlap${unfixTotal === 1 ? '' : 's'} could not be fixed (see below)`);
+    for (const [k, label, max] of [
+      ['siren',  'sirenSettings', eff.siren.max],
+      ['light',  'lightSettings', eff.light.max],
+      ['modkit', 'modKit',        eff.modkit.max],
+    ]) {
+      const list = unfixable[k];
+      if (list.length === 0) continue;
+      header(`-- ${label} unfixable (${list.length}) — every id in 1-${max} already claimed --`);
+      for (const u of list.slice(0, opts.maxList)) {
+        const note = u.kitName ? C.dim(`  ${u.kitName}`) : (u.entry.name ? C.dim(`  ${u.entry.name}`) : '');
+        process.stdout.write(`  ${C.red('#' + u.from)}  ${shortPath(root, u.entry.file)}${note}\n`);
+      }
+      if (list.length > opts.maxList) process.stdout.write(`  ${C.dim(`(${list.length - opts.maxList} more)`)}\n`);
+    }
+    process.stdout.write('\n');
+    if (unfixable.siren.length > 0 && !opts.ssla) {
+      process.stdout.write(`${C.bold('Why this happens:')} GTA V vanilla caps unique sirenSettings IDs at 254. Your server already uses every slot, so no new id can be assigned without overflow.\n\n`);
+      process.stdout.write(`${C.bold('Options:')}\n`);
+      process.stdout.write(`  1. Have every player install ${C.cyan('SirenSetting Limit Adjuster')} client-side, then re-run with ${C.cyan('--ssla')}. Cap rises to 65534.\n`);
+      process.stdout.write(`     ${C.dim('https://www.gta5-mods.com/scripts/sirensetting-limit-adjuster')}\n`);
+      process.stdout.write(`     ${C.dim('https://www.lcpdfr.com/downloads/dev-resources/fivem/50047-fivem-sirensetting-limit-adjuster/')}\n`);
+      process.stdout.write(`  2. Delete duplicate emergency vehicle packs to free slots.\n`);
+      process.stdout.write(`  3. Merge sirens across vehicles (share one entry by name).\n\n`);
+    } else if (unfixable.siren.length > 0 && opts.ssla) {
+      process.stdout.write(`${C.bold('Even with SSLA active, slots 1-65534 are all claimed.')} Audit ${C.cyan('node . list')} and prune unused vehicle packs.\n\n`);
+    }
+  }
   if (!opts.dry) ok('done — restart vehicle resources to load new ids');
+  if (unfixTotal > 0) process.exitCode = 1;
 }
 
 async function cmdRevert(root, opts) {

@@ -19,7 +19,7 @@ GTA V gives every server three small ID buckets:
 
 | Bucket  | Range  | Lives in                                        |
 | ------- | ------ | ----------------------------------------------- |
-| sirens  | 1 to 255  | `carcols.meta` `<Sirens><Item><id>`          |
+| sirens  | 1 to 254 (65534 with SSLA) | `carcols.meta` `<Sirens><Item><id>` |
 | lights  | 1 to 255  | `carcols.meta` `<Lights><Item><id>`          |
 | modkits | 1 to 65535 | `carcols.meta` `<Kits><Item><id>` + `<kitName>` |
 
@@ -76,6 +76,7 @@ After a fix, restart your vehicle resources (or the whole server). FiveM only re
 | Flag                                      | What it does                          |
 | ----------------------------------------- | ------------------------------------- |
 | `--sirens` / `--no-sirens`                | Turn the sirens bucket on or off      |
+| `--ssla` / `--no-ssla`                    | Enable [SirenSetting Limit Adjuster](https://www.gta5-mods.com/scripts/sirensetting-limit-adjuster) mode. Raises the siren cap from 254 to 65534. Requires every client to have the SSLA mod ([FiveM build](https://www.lcpdfr.com/downloads/dev-resources/fivem/50047-fivem-sirensetting-limit-adjuster/)) installed. |
 | `--lights` / `--no-lights`                | Turn the lights bucket on or off      |
 | `--modkits` / `--no-modkits`              | Turn the modkits bucket on or off     |
 | `--dry`                                   | Plan only. Don't write anything       |
@@ -95,7 +96,8 @@ Flags always beat `config.json` for that one run.
   "ignore": [],
   "backup": true,
   "dryRun": false,
-  "report": "pretty"
+  "report": "pretty",
+  "sirenLimitAdjuster": false
 }
 ```
 
@@ -106,6 +108,7 @@ Flags always beat `config.json` for that one run.
 | `backup` | bool     | `true`     | Save a `.bak` before changing anything                             |
 | `dryRun` | bool     | `false`    | Plan only. Don't write                                             |
 | `report` | string   | `"pretty"` | `"pretty"`, `"json"`, or `"quiet"`                                 |
+| `sirenLimitAdjuster` | bool | `false` | Raise siren cap from 254 to 65534. Needs the [SSLA](https://www.gta5-mods.com/scripts/sirensetting-limit-adjuster) client mod installed on every connecting player. |
 
 ## Backups
 
