@@ -106,7 +106,12 @@ async function walk(dir, out, skip) {
 }
 
 function extractBlock(text, tag) {
-  const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i'));
+  // Case-sensitive on purpose: carcols.meta uses PascalCase block tags
+  // (<Sirens>, <Lights>, <Kits>), but each entry contains lowercase children
+  // with the same root word (<sirens>, <lights>). A case-insensitive
+  // non-greedy match closes at the first nested lowercase tag, silently
+  // truncating the block and losing every later entry.
+  const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
   if (!m) return null;
   const start = m.index + m[0].indexOf(m[1]);
   return { content: m[1], start, end: start + m[1].length };
