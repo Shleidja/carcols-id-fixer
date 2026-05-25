@@ -13,6 +13,21 @@ Finds and fixes siren, light, and modkit ID clashes across every `carcols.meta` 
 
 ***
 
+## Updates
+
+**May 25 2026 — run it from the server console**
+
+No SSH needed now. There's a FiveM resource in [`fivem-command/`](fivem-command) that lets you run everything from the live server console, so it works on game panels. Drop it in, add two lines to `server.cfg`:
+
+```cfg
+add_unsafe_child_process_permission "carcols-id-fixer"
+ensure carcols-id-fixer
+```
+
+Then `carcols scan` / `carcols fix` / `carcols revert` straight from the console. Console only, so players can't trigger it in-game. Same engine, same backups, same revert.
+
+***
+
 ## The problem
 
 GTA V gives every server three small ID buckets:
@@ -154,6 +169,20 @@ The rewriter splices the raw bytes of the file. Formatting, comments, indents, a
 ## Credits
 
 Thanks to [**csyon**](https://forum.cfx.re/u/csyon) for pointing out that FiveM raised the modkit ID ceiling from the vanilla `1023` to `65535`, which let us widen the modkit range and stop leaving slots on the table.
+
+## Run it from the server console (game panels)
+
+No SSH? There's a FiveM resource wrapper in [`fivem-command/`](fivem-command)
+that registers a `carcols` console command and runs the engine for you. It
+needs one line in `server.cfg`:
+
+```cfg
+add_unsafe_child_process_permission "carcols-id-fixer"
+ensure carcols-id-fixer
+```
+
+Then `carcols scan` / `carcols fix` / `carcols revert` straight from the panel
+console. See [`fivem-command/README.md`](fivem-command/README.md).
 
 ## License
 
