@@ -273,8 +273,12 @@ function detectConflicts(pools, opts) {
   return result;
 }
 
+// Pick a free id from the TOP of the pool downward. Stock GTA V vehicles
+// occupy the dense low range (modkits, sirens, lights all start near 0), and
+// the scanner can't see stock ids. Assigning low would land reassigned ids
+// straight onto stock-used slots, so we hand out high ids first to stay clear.
 function pickFreeId(pool, used) {
-  for (let i = pool.min; i <= pool.max; i++) if (!used.has(i)) return i;
+  for (let i = pool.max; i >= pool.min; i--) if (!used.has(i)) return i;
   return null;
 }
 
