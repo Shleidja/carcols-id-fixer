@@ -20,8 +20,8 @@ Finds and fixes siren, light, and modkit ID clashes across every `carcols.meta` 
 No SSH needed now. There's a FiveM resource in [`fivem-command/`](fivem-command) that lets you run everything from the live server console, so it works on game panels. Drop it in, add two lines to `server.cfg`:
 
 ```cfg
-add_unsafe_child_process_permission "carcols-id-fixer"
-ensure carcols-id-fixer
+add_unsafe_child_process_permission "fivem-command"
+ensure fivem-command
 ```
 
 Then `carcols scan` / `carcols fix` / `carcols revert` straight from the console. Console only, so players can't trigger it in-game. Same engine, same backups, same revert.
