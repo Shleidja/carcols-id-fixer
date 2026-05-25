@@ -140,11 +140,13 @@ resources/[Vehicles]/foo/data/carcols.meta.bak    ← original
 
 1. Walks `../resources` and reads every `carcols.meta` and `carvariations.meta`.
 2. Builds three ID lists. Anything claimed by more than one file is a clash.
-3. For each clash it keeps the lowest path as the winner, picks the smallest free number in range, and rewrites:
-   * `<id value="N" />` in carcols
-   * `<kitName>N_kitname</kitName>` in carcols (modkits only)
-   * `<Item>N_kitname</Item>` in every `carvariations.meta` that pointed at it
-4. The original is saved as `<file>.bak` (once per file). Running it again on already-fixed files does nothing.
+3. For each clash it keeps the lowest path as the winner and gives the loser a free number from the **top** of the range down. Stock GTA vehicles sit in the low range and the scanner can't see them, so picking high keeps reassigned ids clear of stock.
+4. It rewrites the carcols entry **and** the binding that points at it:
+   * `<id value="N" />` in carcols (all three pools)
+   * `<kitName>N_kitname</kitName>` in carcols (modkits)
+   * `<Item>N_kitname</Item>` in every `carvariations.meta` that referenced that kit (matched by name, globally)
+   * `<sirenSettings value="N" />` and `<lightSettings value="N" />` in the carvariations sitting next to the carcols file (matched by number, scoped to the same folder since these ids repeat across resources)
+5. The original is saved as `<file>.bak` (once per file). Running it again on already-fixed files does nothing.
 
 The rewriter splices the raw bytes of the file. Formatting, comments, indents, and line endings stay exactly the same outside the small bits that change.
 
