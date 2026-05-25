@@ -198,7 +198,8 @@ function parseCarcols(text, file) {
 }
 
 function parseCarvariations(text, file) {
-  const refs = [];
+  // Modkit refs: <kits><Item>ID_name</Item></kits> — matched by full string.
+  const kitRefs = [];
   const kitsRe = /<kits>([\s\S]*?)<\/kits>/gi;
   let km;
   while ((km = kitsRe.exec(text))) {
@@ -207,7 +208,7 @@ function parseCarvariations(text, file) {
     const itemRe = /<Item>\s*(\d+)_([^<\s]+?)\s*<\/Item>/gi;
     let im;
     while ((im = itemRe.exec(inner))) {
-      refs.push({
+      kitRefs.push({
         id: parseInt(im[1], 10),
         kitName: `${im[1]}_${im[2]}`,
         refStart: innerStart + im.index,
@@ -216,7 +217,21 @@ function parseCarvariations(text, file) {
       });
     }
   }
-  return refs;
+
+  // Siren/light refs: <sirenSettings value="N"/> and <lightSettings value="N"/>
+  // bind a vehicle to a carcols <Sirens>/<Lights> <id> by NUMBER. These ids
+  // repeat across resources, so they're matched per-directory at apply time.
+  const numRef = (tag) => {
+    const out = [];
+    const re = new RegExp(`<${tag}\\s+value\\s*=\\s*"(\\d+)"\\s*/?>`, 'gi');
+    let m;
+    while ((m = re.exec(text))) {
+      out.push({ id: parseInt(m[1], 10), start: m.index, end: m.index + m[0].length, tag, sourceFile: file });
+    }
+    return out;
+  };
+
+  return { kitRefs, sirenRefs: numRef('sirenSettings'), lightRefs: numRef('lightSettings') };
 }
 
 const shortPath = (root, abs) => path.relative(root, abs).split(path.sep).join('/');
@@ -226,7 +241,17 @@ async function buildIndex(rootDir, ignore = []) {
   const carcolsMap = new Map();
   const varMap = new Map();
   const pools = { siren: new Map(), light: new Map(), modkit: new Map() };
-  const varRefsByKitName = new Map();
+  const varRefsByKitName = new Map();          // global: kitName -> refs[]
+  const sirenRefsByDir = new Map();            // dir -> (id -> refs[])
+  const lightRefsByDir = new Map();            // dir -> (id -> refs[])
+
+  const addDirRef = (map, dir, ref) => {
+    let byId = map.get(dir);
+    if (!byId) { byId = new Map(); map.set(dir, byId); }
+    const list = byId.get(ref.id) || [];
+    list.push(ref);
+    byId.set(ref.id, list);
+  };
 
   for (const f of found.carcols) {
     const text = await readTextSafe(f); if (text === null) continue;
@@ -238,15 +263,21 @@ async function buildIndex(rootDir, ignore = []) {
   }
   for (const f of found.carvariations) {
     const text = await readTextSafe(f); if (text === null) continue;
-    const refs = parseCarvariations(text, f);
-    varMap.set(f, { text, refs });
-    for (const r of refs) {
+    const { kitRefs, sirenRefs, lightRefs } = parseCarvariations(text, f);
+    varMap.set(f, { text });
+    for (const r of kitRefs) {
       const list = varRefsByKitName.get(r.kitName) || [];
       list.push(r);
       varRefsByKitName.set(r.kitName, list);
     }
+    const dir = path.dirname(f);
+    for (const r of sirenRefs) addDirRef(sirenRefsByDir, dir, r);
+    for (const r of lightRefs) addDirRef(lightRefsByDir, dir, r);
   }
-  return { files: { carcols: carcolsMap, carvariations: varMap }, pools, varRefsByKitName };
+  return {
+    files: { carcols: carcolsMap, carvariations: varMap },
+    pools, varRefsByKitName, sirenRefsByDir, lightRefsByDir,
+  };
 }
 
 function addEntries(map, entries) {
@@ -317,29 +348,48 @@ function planReassignments(pools, conflicts, opts) {
   return { plan, unfixable, eff };
 }
 
-async function applyPlan({ files, plan, varRefsByKitName, backup, dryRun }) {
+async function applyPlan({ files, plan, varRefsByKitName, sirenRefsByDir, lightRefsByDir, backup, dryRun }) {
   const editsByFile = new Map();
   const addEdit = (file, start, end, replacement) => {
     const arr = editsByFile.get(file) || [];
     arr.push({ start, end, replacement });
     editsByFile.set(file, arr);
   };
+  let refEdits = 0;
 
-  const visit = (group, isModkit = false) => {
+  // Rewrite the matching carvariations <sirenSettings>/<lightSettings> value=N,
+  // scoped to the same directory as the carcols file being renumbered (these
+  // ids repeat across resources, so a global update would corrupt other cars).
+  const updateNumRefs = (byDir, dir, fromId, toId, tag) => {
+    const byId = byDir.get(dir);
+    if (!byId) return;
+    for (const r of byId.get(fromId) || []) {
+      addEdit(r.sourceFile, r.start, r.end, `<${tag} value="${toId}" />`);
+      refEdits++;
+    }
+  };
+
+  const visit = (group, kind) => {
     for (const change of group) {
       const e = change.entry;
       addEdit(e.file, e.idMatch.start, e.idMatch.end, `<id value="${change.to}" />`);
-      if (isModkit && e.kitNameMatch) {
+      const dir = path.dirname(e.file);
+      if (kind === 'modkit' && e.kitNameMatch) {
         const stripped = (e.kitName || '').replace(/^\d+_/, '');
         const newKitName = `${change.to}_${stripped}`;
         addEdit(e.file, e.kitNameMatch.start, e.kitNameMatch.end, `<kitName>${newKitName}</kitName>`);
         for (const r of varRefsByKitName.get(e.kitName) || []) {
           addEdit(r.sourceFile, r.refStart, r.refEnd, `<Item>${newKitName}</Item>`);
+          refEdits++;
         }
+      } else if (kind === 'siren') {
+        updateNumRefs(sirenRefsByDir, dir, change.from, change.to, 'sirenSettings');
+      } else if (kind === 'light') {
+        updateNumRefs(lightRefsByDir, dir, change.from, change.to, 'lightSettings');
       }
     }
   };
-  visit(plan.siren); visit(plan.light); visit(plan.modkit, true);
+  visit(plan.siren, 'siren'); visit(plan.light, 'light'); visit(plan.modkit, 'modkit');
 
   const writes = [];
   for (const [file, edits] of editsByFile) {
@@ -351,7 +401,7 @@ async function applyPlan({ files, plan, varRefsByKitName, backup, dryRun }) {
     writes.push({ file, text });
   }
 
-  if (dryRun) return { writes, written: 0 };
+  if (dryRun) return { writes, written: 0, refEdits };
 
   let written = 0;
   for (const w of writes) {
@@ -362,7 +412,7 @@ async function applyPlan({ files, plan, varRefsByKitName, backup, dryRun }) {
     await fs.writeFile(w.file, w.text, 'utf8');
     written++;
   }
-  return { writes, written };
+  return { writes, written, refEdits };
 }
 
 async function revertAll(rootDir) {
@@ -584,11 +634,15 @@ async function cmdFix(root, opts, config) {
   }
 
   const result = await applyPlan({
-    files: idx.files, plan, varRefsByKitName: idx.varRefsByKitName,
+    files: idx.files, plan,
+    varRefsByKitName: idx.varRefsByKitName,
+    sirenRefsByDir: idx.sirenRefsByDir,
+    lightRefsByDir: idx.lightRefsByDir,
     backup: opts.backup, dryRun: opts.dry,
   });
 
   if (!opts.quiet) {
+    step('refs',  `${C.cyan(result.refEdits)} carvariations bindings updated`);
     if (opts.dry) {
       step('dry',   `${C.yellow(result.writes.length)} files would change · ${C.dim('no writes performed')}`);
       printPlan(root, plan, opts.maxList);
@@ -698,6 +752,7 @@ async function main(argv) {
 
   const config = await loadConfig(process.cwd());
   const opts = mergeOpts(config, cli);
+  if (opts.json) opts.quiet = true; // JSON output must be the only thing on stdout
   const root = cli.root || resolveResourcesDir(config._path);
 
   if (cli.cmd === 'scan')   return cmdScan(root, opts, config);
