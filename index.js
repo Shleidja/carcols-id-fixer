@@ -4,21 +4,12 @@ import path from 'node:path';
 
 const VERSION = '0.1.0';
 
-// Pool ranges:
-//   siren / light: vanilla GTA V cap is 0-255. FiveM has not raised this
-//                  server-side. Client-side, SirenSetting Limit Adjuster
-//                  (SSLA, by cp702) raises the siren ID cap to 65535 with
-//                  three reserved values: 0, 255, 65535. Enable via
-//                  `sirenLimitAdjuster: true` in config.json or `--ssla`.
-//   modkit:        FiveM bumped vanilla 0-1023 to 0-65535 via
-//                  citizenfx/fivem ModKitIdRelocation.cpp
-//                  (constexpr int NUM_MODKIT_INDICES = 65536).
 const POOLS = {
   siren:  { min: 1, max: 254,   label: 'sirenSettings' },
   light:  { min: 1, max: 255,   label: 'lightSettings' },
   modkit: { min: 1, max: 65535, label: 'modKit' },
 };
-const SSLA_SIREN_MAX = 65534;        // SSLA raises cap, but 65535 is reserved
+const SSLA_SIREN_MAX = 65534;
 const SSLA_RESERVED  = new Set([0, 255, 65535]);
 const PROTECTED = { siren: new Set([0]), light: new Set([0]), modkit: new Set([0]) };
 const TARGET_FILES = new Set(['carcols.meta', 'carvariations.meta']);
@@ -33,7 +24,6 @@ const DEFAULTS = {
   sirenLimitAdjuster: false,
 };
 
-// Hard-coded — CarcolsPatcher folder lives next to server.cfg, sibling to resources/.
 const RESOURCES_REL = '../resources';
 
 const isTTY = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -125,11 +115,6 @@ async function walk(dir, out, skip) {
 }
 
 function extractBlock(text, tag) {
-  // Case-sensitive on purpose: carcols.meta uses PascalCase block tags
-  // (<Sirens>, <Lights>, <Kits>), but each entry contains lowercase children
-  // with the same root word (<sirens>, <lights>). A case-insensitive
-  // non-greedy match closes at the first nested lowercase tag, silently
-  // truncating the block and losing every later entry.
   const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
   if (!m) return null;
   const start = m.index + m[0].indexOf(m[1]);
@@ -198,7 +183,6 @@ function parseCarcols(text, file) {
 }
 
 function parseCarvariations(text, file) {
-  // Modkit refs: <kits><Item>ID_name</Item></kits> — matched by full string.
   const kitRefs = [];
   const kitsRe = /<kits>([\s\S]*?)<\/kits>/gi;
   let km;
@@ -218,9 +202,6 @@ function parseCarvariations(text, file) {
     }
   }
 
-  // Siren/light refs: <sirenSettings value="N"/> and <lightSettings value="N"/>
-  // bind a vehicle to a carcols <Sirens>/<Lights> <id> by NUMBER. These ids
-  // repeat across resources, so they're matched per-directory at apply time.
   const numRef = (tag) => {
     const out = [];
     const re = new RegExp(`<${tag}\\s+value\\s*=\\s*"(\\d+)"\\s*/?>`, 'gi');
@@ -241,9 +222,9 @@ async function buildIndex(rootDir, ignore = []) {
   const carcolsMap = new Map();
   const varMap = new Map();
   const pools = { siren: new Map(), light: new Map(), modkit: new Map() };
-  const varRefsByKitName = new Map();          // global: kitName -> refs[]
-  const sirenRefsByDir = new Map();            // dir -> (id -> refs[])
-  const lightRefsByDir = new Map();            // dir -> (id -> refs[])
+  const varRefsByKitName = new Map();
+  const sirenRefsByDir = new Map();
+  const lightRefsByDir = new Map();
 
   const addDirRef = (map, dir, ref) => {
     let byId = map.get(dir);
@@ -274,9 +255,22 @@ async function buildIndex(rootDir, ignore = []) {
     for (const r of sirenRefs) addDirRef(sirenRefsByDir, dir, r);
     for (const r of lightRefs) addDirRef(lightRefsByDir, dir, r);
   }
+  const kitNameSet = new Set();
+  const kitNamesBySuffix = new Map();
+  for (const [, { parsed }] of carcolsMap) {
+    for (const k of parsed.kits) {
+      if (!k.kitName) continue;
+      kitNameSet.add(k.kitName);
+      const suffix = k.kitName.replace(/^\d+_/, '');
+      const list = kitNamesBySuffix.get(suffix) || [];
+      if (!list.includes(k.kitName)) list.push(k.kitName);
+      kitNamesBySuffix.set(suffix, list);
+    }
+  }
   return {
     files: { carcols: carcolsMap, carvariations: varMap },
     pools, varRefsByKitName, sirenRefsByDir, lightRefsByDir,
+    kitNameSet, kitNamesBySuffix,
   };
 }
 
@@ -292,6 +286,17 @@ async function readTextSafe(p) {
   try { return (await fs.readFile(p)).toString('utf8'); } catch { return null; }
 }
 
+function detectDanglingKitRefs(idx) {
+  const out = [];
+  for (const [kitName, refs] of idx.varRefsByKitName) {
+    if (idx.kitNameSet.has(kitName)) continue;
+    const suffix = kitName.replace(/^\d+_/, '');
+    const candidates = idx.kitNamesBySuffix.get(suffix) || [];
+    out.push({ kitName, suffix, refs, candidates });
+  }
+  return out;
+}
+
 function detectConflicts(pools, opts) {
   const result = { siren: [], light: [], modkit: [] };
   for (const key of ['siren', 'light', 'modkit']) {
@@ -304,10 +309,6 @@ function detectConflicts(pools, opts) {
   return result;
 }
 
-// Pick a free id from the TOP of the pool downward. Stock GTA V vehicles
-// occupy the dense low range (modkits, sirens, lights all start near 0), and
-// the scanner can't see stock ids. Assigning low would land reassigned ids
-// straight onto stock-used slots, so we hand out high ids first to stay clear.
 function pickFreeId(pool, used) {
   for (let i = pool.max; i >= pool.min; i--) if (!used.has(i)) return i;
   return null;
@@ -320,7 +321,6 @@ function planReassignments(pools, conflicts, opts) {
     light:  new Set(pools.light.keys()),
     modkit: new Set(pools.modkit.keys()),
   };
-  // Lock reserved values out of the picker.
   if (opts.ssla) for (const v of SSLA_RESERVED) used.siren.add(v);
   for (const v of PROTECTED.siren)  used.siren.add(v);
   for (const v of PROTECTED.light)  used.light.add(v);
@@ -329,7 +329,7 @@ function planReassignments(pools, conflicts, opts) {
   const plan       = { siren: [], light: [], modkit: [] };
   const unfixable  = { siren: [], light: [], modkit: [] };
 
-  for (const key of ['siren', 'light', 'modkit']) {
+  for (const key of ['siren', 'light']) {
     if (!opts[key]) continue;
     for (const conflict of conflicts[key]) {
       const sorted = [...conflict.entries].sort((a, b) => a.file.localeCompare(b.file));
@@ -337,29 +337,61 @@ function planReassignments(pools, conflicts, opts) {
         const e = sorted[i];
         const newId = pickFreeId(eff[key], used[key]);
         if (newId === null) {
-          unfixable[key].push({ from: e.id, entry: e, kitName: e.kitName });
+          unfixable[key].push({ from: e.id, entry: e });
           continue;
         }
         used[key].add(newId);
-        plan[key].push({ from: e.id, to: newId, entry: e, kitName: e.kitName });
+        plan[key].push({ from: e.id, to: newId, entry: e });
+      }
+    }
+  }
+
+  if (opts.modkit) {
+    for (const conflict of conflicts.modkit) {
+      const groups = new Map();
+      for (const e of conflict.entries) {
+        const gkey = e.kitName || `__noname__::${e.file}`;
+        const list = groups.get(gkey) || [];
+        list.push(e);
+        groups.set(gkey, list);
+      }
+      if (groups.size < 2) continue;
+      const groupList = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b));
+      for (let i = 1; i < groupList.length; i++) {
+        const [, entries] = groupList[i];
+        const newId = pickFreeId(eff.modkit, used.modkit);
+        if (newId === null) {
+          for (const e of entries) unfixable.modkit.push({ from: e.id, entry: e, kitName: e.kitName });
+          continue;
+        }
+        used.modkit.add(newId);
+        for (const e of entries) plan.modkit.push({ from: e.id, to: newId, entry: e, kitName: e.kitName });
       }
     }
   }
   return { plan, unfixable, eff };
 }
 
-async function applyPlan({ files, plan, varRefsByKitName, sirenRefsByDir, lightRefsByDir, backup, dryRun }) {
+function buildEdits({ plan, varRefsByKitName, sirenRefsByDir, lightRefsByDir, danglingRepairs = [] }) {
   const editsByFile = new Map();
+  const seenEdits = new Set();
+  let refEdits = 0;
   const addEdit = (file, start, end, replacement) => {
+    const sig = `${file}\0${start}\0${end}`;
+    if (seenEdits.has(sig)) return;
+    seenEdits.add(sig);
     const arr = editsByFile.get(file) || [];
     arr.push({ start, end, replacement });
     editsByFile.set(file, arr);
   };
-  let refEdits = 0;
 
-  // Rewrite the matching carvariations <sirenSettings>/<lightSettings> value=N,
-  // scoped to the same directory as the carcols file being renumbered (these
-  // ids repeat across resources, so a global update would corrupt other cars).
+  for (const d of danglingRepairs) {
+    for (const r of d.refs) {
+      addEdit(r.sourceFile, r.refStart, r.refEnd, `<Item>${d.target}</Item>`);
+      refEdits++;
+    }
+  }
+
   const updateNumRefs = (byDir, dir, fromId, toId, tag) => {
     const byId = byDir.get(dir);
     if (!byId) return;
@@ -391,17 +423,45 @@ async function applyPlan({ files, plan, varRefsByKitName, sirenRefsByDir, lightR
   };
   visit(plan.siren, 'siren'); visit(plan.light, 'light'); visit(plan.modkit, 'modkit');
 
+  return { editsByFile, refEdits };
+}
+
+function validateEdits(editsByFile) {
+  const errors = [];
+  for (const [file, edits] of editsByFile) {
+    for (const ed of edits) {
+      if (!Number.isInteger(ed.start) || !Number.isInteger(ed.end) || ed.start < 0 || ed.end < ed.start) {
+        errors.push({ file, reason: `invalid range start=${ed.start} end=${ed.end}` });
+      }
+      if (typeof ed.replacement !== 'string') {
+        errors.push({ file, reason: `non-string replacement` });
+      }
+    }
+    const sorted = [...edits].sort((a, b) => a.start - b.start);
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i].start < sorted[i - 1].end) {
+        errors.push({
+          file,
+          reason: `overlapping edits at [${sorted[i - 1].start},${sorted[i - 1].end}] and [${sorted[i].start},${sorted[i].end}]`,
+        });
+      }
+    }
+  }
+  return errors;
+}
+
+async function applyEdits({ files, editsByFile, backup, dryRun }) {
   const writes = [];
   for (const [file, edits] of editsByFile) {
-    edits.sort((a, b) => b.start - a.start);
+    const sorted = [...edits].sort((a, b) => b.start - a.start);
     const meta = files.carcols.get(file) || files.carvariations.get(file);
     if (!meta) continue;
     let text = meta.text;
-    for (const ed of edits) text = text.slice(0, ed.start) + ed.replacement + text.slice(ed.end);
+    for (const ed of sorted) text = text.slice(0, ed.start) + ed.replacement + text.slice(ed.end);
     writes.push({ file, text });
   }
 
-  if (dryRun) return { writes, written: 0, refEdits };
+  if (dryRun) return { writes, written: 0 };
 
   let written = 0;
   for (const w of writes) {
@@ -412,7 +472,7 @@ async function applyPlan({ files, plan, varRefsByKitName, sirenRefsByDir, lightR
     await fs.writeFile(w.file, w.text, 'utf8');
     written++;
   }
-  return { writes, written, refEdits };
+  return { writes, written };
 }
 
 async function revertAll(rootDir) {
@@ -546,6 +606,23 @@ function printConflictTable(root, label, list, maxList) {
   if (list.length > rows.length) process.stdout.write(`  ${C.dim(`(${list.length - rows.length} more — raise --max-list to see all)`)}\n`);
 }
 
+function printDanglingTable(root, dangling, maxList) {
+  if (dangling.length === 0) return;
+  header(`-- dangling kit bindings (${dangling.length}) --`);
+  const rows = dangling.slice(0, maxList);
+  for (const d of rows) {
+    const fix = d.candidates.length === 1
+      ? `${C.dim('→')} ${C.green(d.candidates[0])} ${C.dim('(auto-repair)')}`
+      : d.candidates.length === 0
+        ? C.red('no matching kitName in any carcols')
+        : `${C.yellow('ambiguous')} ${C.dim('candidates: ' + d.candidates.join(', '))}`;
+    process.stdout.write(`  ${C.red(d.kitName)}  ${fix}\n`);
+    for (const r of d.refs.slice(0, 5)) process.stdout.write(`    ${C.gray('-')} ${shortPath(root, r.sourceFile)}\n`);
+    if (d.refs.length > 5) process.stdout.write(`    ${C.dim(`(${d.refs.length - 5} more refs)`)}\n`);
+  }
+  if (dangling.length > rows.length) process.stdout.write(`  ${C.dim(`(${dangling.length - rows.length} more)`)}\n`);
+}
+
 function printPlan(root, plan, maxList) {
   for (const [k, label] of [['siren', 'sirenSettings'], ['light', 'lightSettings'], ['modkit', 'modKit']]) {
     if (plan[k].length === 0) continue;
@@ -592,21 +669,32 @@ async function cmdScan(root, opts, config) {
     step('pool',  poolSizesLine(idx.pools));
   }
   const conflicts = detectConflicts(idx.pools, opts);
+  const dangling = opts.modkit ? detectDanglingKitRefs(idx) : [];
   const sN = conflicts.siren.length, lN = conflicts.light.length, mN = conflicts.modkit.length;
   if (!opts.quiet) {
     step('siren',  collisionBadge(sN, opts.siren));
     step('light',  collisionBadge(lN, opts.light));
     step('modkit', collisionBadge(mN, opts.modkit));
+    const dN = dangling.length;
+    if (opts.modkit) step('bind', dN === 0 ? C.green('clean') : C.red(`${dN} dangling kit binding${dN === 1 ? '' : 's'}`));
   }
-  if (opts.json) { process.stdout.write(JSON.stringify(toJson(root, conflicts, idx.pools), null, 2) + '\n'); return; }
+  if (opts.json) {
+    const j = toJson(root, conflicts, idx.pools);
+    j.danglingKitRefs = dangling.map((d) => ({
+      kitName: d.kitName, candidates: d.candidates,
+      refs: d.refs.map((r) => ({ file: shortPath(root, r.sourceFile) })),
+    }));
+    process.stdout.write(JSON.stringify(j, null, 2) + '\n'); return;
+  }
   if (!opts.quiet) {
     printConflictTable(root, 'sirenSettings', conflicts.siren, opts.maxList);
     printConflictTable(root, 'lightSettings', conflicts.light, opts.maxList);
     printConflictTable(root, 'modKit',         conflicts.modkit, opts.maxList);
+    printDanglingTable(root, dangling, opts.maxList);
   }
-  const total = sN + lN + mN;
+  const total = sN + lN + mN + dangling.length;
   if (total === 0) ok('clean — no overlapping ids in scanned pools');
-  else warn(`${total} overlap${total === 1 ? '' : 's'} — run \`node . fix\` to patch`);
+  else warn(`${total} issue${total === 1 ? '' : 's'} — run \`node . fix\` to patch`);
 }
 
 async function cmdFix(root, opts, config) {
@@ -617,13 +705,24 @@ async function cmdFix(root, opts, config) {
   }
   const idx = await buildIndex(root, opts.ignore);
   const conflicts = detectConflicts(idx.pools, opts);
+  const dangling = opts.modkit ? detectDanglingKitRefs(idx) : [];
+  const danglingRepairs = dangling
+    .filter((d) => d.candidates.length === 1)
+    .map((d) => ({ kitName: d.kitName, target: d.candidates[0], refs: d.refs }));
+  const danglingUnfixable = dangling.filter((d) => d.candidates.length !== 1);
   const sN = conflicts.siren.length, lN = conflicts.light.length, mN = conflicts.modkit.length;
   if (!opts.quiet) {
     step('siren',  collisionBadge(sN, opts.siren));
     step('light',  collisionBadge(lN, opts.light));
     step('modkit', collisionBadge(mN, opts.modkit));
+    if (opts.modkit) {
+      const repaired = danglingRepairs.length;
+      const dN = dangling.length;
+      step('bind', dN === 0 ? C.green('clean')
+        : `${C.cyan(repaired)} auto-repair · ${danglingUnfixable.length ? C.red(danglingUnfixable.length + ' unfixable') : C.dim('0 unfixable')}`);
+    }
   }
-  if (sN + lN + mN === 0) { ok('nothing to patch'); return; }
+  if (sN + lN + mN === 0 && danglingRepairs.length === 0 && danglingUnfixable.length === 0) { ok('nothing to patch'); return; }
 
   const { plan, unfixable, eff } = planReassignments(idx.pools, conflicts, opts);
   const total = plan.siren.length + plan.light.length + plan.modkit.length;
@@ -633,19 +732,40 @@ async function cmdFix(root, opts, config) {
     step('error', `${C.red(unfixTotal)} unfixable · pool exhausted`);
   }
 
-  const result = await applyPlan({
-    files: idx.files, plan,
+  const { editsByFile, refEdits } = buildEdits({
+    plan,
     varRefsByKitName: idx.varRefsByKitName,
     sirenRefsByDir: idx.sirenRefsByDir,
     lightRefsByDir: idx.lightRefsByDir,
+    danglingRepairs,
+  });
+
+  const validationErrors = validateEdits(editsByFile);
+  if (validationErrors.length > 0) {
+    if (!opts.quiet) step('check', C.red(`${validationErrors.length} validation error${validationErrors.length === 1 ? '' : 's'}`));
+    process.stdout.write('\n');
+    errOut(`VALIDATION FAILED — no files written. Patch aborted to prevent corruption.`);
+    for (const v of validationErrors.slice(0, opts.maxList)) {
+      process.stdout.write(`  ${C.red('xx')}  ${shortPath(root, v.file)} ${C.dim(v.reason)}\n`);
+    }
+    if (validationErrors.length > opts.maxList) process.stdout.write(`  ${C.dim(`(${validationErrors.length - opts.maxList} more)`)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!opts.quiet) step('check', C.green(`${editsByFile.size} file${editsByFile.size === 1 ? '' : 's'} validated`));
+
+  const result = await applyEdits({
+    files: idx.files, editsByFile,
     backup: opts.backup, dryRun: opts.dry,
   });
+  result.refEdits = refEdits;
 
   if (!opts.quiet) {
     step('refs',  `${C.cyan(result.refEdits)} carvariations bindings updated`);
     if (opts.dry) {
       step('dry',   `${C.yellow(result.writes.length)} files would change · ${C.dim('no writes performed')}`);
       printPlan(root, plan, opts.maxList);
+      printDanglingTable(root, dangling, opts.maxList);
     } else {
       step('write', `${C.green(result.written)} files patched` + (opts.backup ? C.dim(' · .bak written') : ''));
     }
@@ -752,7 +872,7 @@ async function main(argv) {
 
   const config = await loadConfig(process.cwd());
   const opts = mergeOpts(config, cli);
-  if (opts.json) opts.quiet = true; // JSON output must be the only thing on stdout
+  if (opts.json) opts.quiet = true;
   const root = cli.root || resolveResourcesDir(config._path);
 
   if (cli.cmd === 'scan')   return cmdScan(root, opts, config);
