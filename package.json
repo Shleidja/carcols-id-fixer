@@ -8,7 +8,7 @@
     "carcols-id-fixer": "index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=16"
   },
   "repository": {
     "type": "git",
