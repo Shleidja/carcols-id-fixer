@@ -372,22 +372,51 @@ function planReassignments(pools, conflicts, opts) {
   return { plan, unfixable, eff };
 }
 
+// Expected shapes of the text each edit is allowed to replace. Checked against
+// the live source before writing (see checkEditTargets) so a miscomputed offset
+// aborts the patch instead of splicing a replacement into the middle of a tag
+// and leaving stray symbols behind.
+const EXPECT_ID      = /^<id\s+value\s*=\s*"-?\d+"\s*\/?>$/i;
+const EXPECT_KITNAME = /^<kitName>\s*[^<]*\s*<\/kitName>$/i;
+const EXPECT_KITREF  = /^<Item>\s*\d+_[^<\s]+\s*<\/Item>$/i;
+const expectNumRef   = (tag) => new RegExp(`^<${tag}\\s+value\\s*=\\s*"\\d+"\\s*/?>$`, 'i');
+
+const newKitNameOf = (change) =>
+  `${change.to}_${(change.entry.kitName || '').replace(/^\d+_/, '')}`;
+
 function buildEdits({ plan, varRefsByKitName, sirenRefsByDir, lightRefsByDir, danglingRepairs = [] }) {
   const editsByFile = new Map();
-  const seenEdits = new Set();
+  const seenEdits = new Map();
+  const editConflicts = [];
   let refEdits = 0;
-  const addEdit = (file, start, end, replacement) => {
+  const addEdit = (file, start, end, replacement, expect) => {
     const sig = `${file}\0${start}\0${end}`;
-    if (seenEdits.has(sig)) return;
-    seenEdits.add(sig);
+    const prev = seenEdits.get(sig);
+    if (prev !== undefined) {
+      // Same span already targeted. Identical replacement is a harmless dup;
+      // a different one means two producers disagree on this binding — surface
+      // it as a hard conflict rather than silently keeping whichever ran first.
+      if (prev !== replacement) editConflicts.push({ file, start, end, a: prev, b: replacement });
+      return;
+    }
+    seenEdits.set(sig, replacement);
     const arr = editsByFile.get(file) || [];
-    arr.push({ start, end, replacement });
+    arr.push({ start, end, replacement, expect });
     editsByFile.set(file, arr);
   };
 
+  // Authoritative map of every modkit rename happening this run, computed up
+  // front so dangling repairs resolve to the FINAL kit name (post-rename) and
+  // never to a name the rename pass is about to invalidate.
+  const kitRename = new Map();
+  for (const change of plan.modkit) {
+    if (change.entry.kitNameMatch) kitRename.set(change.entry.kitName, newKitNameOf(change));
+  }
+
   for (const d of danglingRepairs) {
+    const finalTarget = kitRename.get(d.target) || d.target;
     for (const r of d.refs) {
-      addEdit(r.sourceFile, r.refStart, r.refEnd, `<Item>${d.target}</Item>`);
+      addEdit(r.sourceFile, r.refStart, r.refEnd, `<Item>${finalTarget}</Item>`, EXPECT_KITREF);
       refEdits++;
     }
   }
@@ -396,7 +425,7 @@ function buildEdits({ plan, varRefsByKitName, sirenRefsByDir, lightRefsByDir, da
     const byId = byDir.get(dir);
     if (!byId) return;
     for (const r of byId.get(fromId) || []) {
-      addEdit(r.sourceFile, r.start, r.end, `<${tag} value="${toId}" />`);
+      addEdit(r.sourceFile, r.start, r.end, `<${tag} value="${toId}" />`, expectNumRef(tag));
       refEdits++;
     }
   };
@@ -404,14 +433,13 @@ function buildEdits({ plan, varRefsByKitName, sirenRefsByDir, lightRefsByDir, da
   const visit = (group, kind) => {
     for (const change of group) {
       const e = change.entry;
-      addEdit(e.file, e.idMatch.start, e.idMatch.end, `<id value="${change.to}" />`);
+      addEdit(e.file, e.idMatch.start, e.idMatch.end, `<id value="${change.to}" />`, EXPECT_ID);
       const dir = path.dirname(e.file);
       if (kind === 'modkit' && e.kitNameMatch) {
-        const stripped = (e.kitName || '').replace(/^\d+_/, '');
-        const newKitName = `${change.to}_${stripped}`;
-        addEdit(e.file, e.kitNameMatch.start, e.kitNameMatch.end, `<kitName>${newKitName}</kitName>`);
+        const newKitName = newKitNameOf(change);
+        addEdit(e.file, e.kitNameMatch.start, e.kitNameMatch.end, `<kitName>${newKitName}</kitName>`, EXPECT_KITNAME);
         for (const r of varRefsByKitName.get(e.kitName) || []) {
-          addEdit(r.sourceFile, r.refStart, r.refEnd, `<Item>${newKitName}</Item>`);
+          addEdit(r.sourceFile, r.refStart, r.refEnd, `<Item>${newKitName}</Item>`, EXPECT_KITREF);
           refEdits++;
         }
       } else if (kind === 'siren') {
@@ -423,7 +451,7 @@ function buildEdits({ plan, varRefsByKitName, sirenRefsByDir, lightRefsByDir, da
   };
   visit(plan.siren, 'siren'); visit(plan.light, 'light'); visit(plan.modkit, 'modkit');
 
-  return { editsByFile, refEdits };
+  return { editsByFile, refEdits, editConflicts };
 }
 
 function validateEdits(editsByFile) {
@@ -444,6 +472,25 @@ function validateEdits(editsByFile) {
           file,
           reason: `overlapping edits at [${sorted[i - 1].start},${sorted[i - 1].end}] and [${sorted[i].start},${sorted[i].end}]`,
         });
+      }
+    }
+  }
+  return errors;
+}
+
+// Last line of defense against corruption: confirm every edit's span in the
+// untouched source still looks like the exact tag we meant to rewrite. A bad
+// offset would otherwise overwrite arbitrary text and emit broken markup.
+function checkEditTargets(files, editsByFile) {
+  const errors = [];
+  for (const [file, edits] of editsByFile) {
+    const meta = files.carcols.get(file) || files.carvariations.get(file);
+    if (!meta) { errors.push({ file, reason: 'no source text loaded for edit target' }); continue; }
+    for (const ed of edits) {
+      if (!ed.expect) continue;
+      const slice = meta.text.slice(ed.start, ed.end);
+      if (!ed.expect.test(slice)) {
+        errors.push({ file, reason: `edit target mismatch at [${ed.start},${ed.end}] — found ${JSON.stringify(slice.slice(0, 48))}` });
       }
     }
   }
@@ -732,7 +779,7 @@ async function cmdFix(root, opts, config) {
     step('error', `${C.red(unfixTotal)} unfixable · pool exhausted`);
   }
 
-  const { editsByFile, refEdits } = buildEdits({
+  const { editsByFile, refEdits, editConflicts } = buildEdits({
     plan,
     varRefsByKitName: idx.varRefsByKitName,
     sirenRefsByDir: idx.sirenRefsByDir,
@@ -740,7 +787,14 @@ async function cmdFix(root, opts, config) {
     danglingRepairs,
   });
 
-  const validationErrors = validateEdits(editsByFile);
+  const validationErrors = [
+    ...validateEdits(editsByFile),
+    ...checkEditTargets(idx.files, editsByFile),
+    ...editConflicts.map((cc) => ({
+      file: cc.file,
+      reason: `conflicting rewrites for the same span [${cc.start},${cc.end}]: ${JSON.stringify(cc.a)} vs ${JSON.stringify(cc.b)}`,
+    })),
+  ];
   if (validationErrors.length > 0) {
     if (!opts.quiet) step('check', C.red(`${validationErrors.length} validation error${validationErrors.length === 1 ? '' : 's'}`));
     process.stdout.write('\n');
