@@ -2,7 +2,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 
 const POOLS = {
   siren:  { min: 1, max: 254,   label: 'sirenSettings' },
@@ -297,13 +297,56 @@ function detectDanglingKitRefs(idx) {
   return out;
 }
 
+// Damage left behind by pre-0.1.x patchers (doubled brackets like `/>>`) makes
+// the game silently drop the whole file — rainbow paint, dead lights, spawn
+// crashes. Detect it so the owner knows to `revert` instead of re-running fix.
+function detectCorruption(files) {
+  const out = [];
+  for (const map of [files.carcols, files.carvariations]) {
+    for (const [file, { text }] of map) {
+      const m = text.match(/>\s*>/);
+      if (!m) continue;
+      const line = text.slice(0, m.index).split('\n').length;
+      out.push({ file, line });
+    }
+  }
+  return out;
+}
+
+function printCorruptionTable(root, corrupt) {
+  if (corrupt.length === 0) return;
+  header(`-- corrupted meta files (${corrupt.length}) --`);
+  for (const cr of corrupt) {
+    process.stdout.write(`  ${C.red(shortPath(root, cr.file))} ${C.dim(`stray ">>" near line ${cr.line}`)}\n`);
+  }
+  warn(`doubled ">>" markup — the game ignores these files entirely (mismatched colors, dead lights, spawn crashes).`);
+  warn(`run \`node . revert\` (or \`carcols revert\` in the server console) to restore the .bak originals, then re-run fix.`);
+}
+
+// Modkit entries sharing one kitName are the same kit streamed from several
+// files — not a conflict. Group by kitName (nameless kits by file) so scan and
+// fix agree on what counts as an overlap; disagreement here made scan report
+// conflicts that fix would (correctly) never touch.
+function modkitGroups(entries) {
+  const groups = new Map();
+  for (const e of entries) {
+    const gkey = e.kitName || `__noname__::${e.file}`;
+    const list = groups.get(gkey) || [];
+    list.push(e);
+    groups.set(gkey, list);
+  }
+  return groups;
+}
+
 function detectConflicts(pools, opts) {
   const result = { siren: [], light: [], modkit: [] };
   for (const key of ['siren', 'light', 'modkit']) {
     if (!opts[key]) continue;
     for (const [id, entries] of pools[key]) {
       if (PROTECTED[key].has(id)) continue;
-      if (entries.length > 1) result[key].push({ id, entries });
+      if (entries.length < 2) continue;
+      if (key === 'modkit' && modkitGroups(entries).size < 2) continue;
+      result[key].push({ id, entries });
     }
   }
   return result;
@@ -348,13 +391,7 @@ function planReassignments(pools, conflicts, opts) {
 
   if (opts.modkit) {
     for (const conflict of conflicts.modkit) {
-      const groups = new Map();
-      for (const e of conflict.entries) {
-        const gkey = e.kitName || `__noname__::${e.file}`;
-        const list = groups.get(gkey) || [];
-        list.push(e);
-        groups.set(gkey, list);
-      }
+      const groups = modkitGroups(conflict.entries);
       if (groups.size < 2) continue;
       const groupList = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b));
       for (let i = 1; i < groupList.length; i++) {
@@ -707,10 +744,12 @@ const toJson = (root, conflicts, pools) => {
 async function cmdScan(root, opts, config) {
   await assertDir(root);
   if (!opts.quiet) {
+    step('ver',   C.dim(`carcols-patcher v${VERSION} · engine ${process.argv[1] || 'index.js'}`));
     step('cfg',   config._path ? `read ${C.dim(path.basename(config._path))}` : C.dim('using defaults (no config.json)'));
     step('walk',  C.dim(root));
   }
   const idx = await buildIndex(root, opts.ignore);
+  const corrupt = detectCorruption(idx.files);
   if (!opts.quiet) {
     step('index', `${C.cyan(idx.files.carcols.size)} carcols / ${C.cyan(idx.files.carvariations.size)} carvariations`);
     step('pool',  poolSizesLine(idx.pools));
@@ -724,6 +763,7 @@ async function cmdScan(root, opts, config) {
     step('modkit', collisionBadge(mN, opts.modkit));
     const dN = dangling.length;
     if (opts.modkit) step('bind', dN === 0 ? C.green('clean') : C.red(`${dN} dangling kit binding${dN === 1 ? '' : 's'}`));
+    step('xml', corrupt.length === 0 ? C.green('clean') : C.red(`${corrupt.length} corrupted file${corrupt.length === 1 ? '' : 's'}`));
   }
   if (opts.json) {
     const j = toJson(root, conflicts, idx.pools);
@@ -731,6 +771,7 @@ async function cmdScan(root, opts, config) {
       kitName: d.kitName, candidates: d.candidates,
       refs: d.refs.map((r) => ({ file: shortPath(root, r.sourceFile) })),
     }));
+    j.corruptedFiles = corrupt.map((cr) => ({ file: shortPath(root, cr.file), line: cr.line }));
     process.stdout.write(JSON.stringify(j, null, 2) + '\n'); return;
   }
   if (!opts.quiet) {
@@ -738,8 +779,9 @@ async function cmdScan(root, opts, config) {
     printConflictTable(root, 'lightSettings', conflicts.light, opts.maxList);
     printConflictTable(root, 'modKit',         conflicts.modkit, opts.maxList);
     printDanglingTable(root, dangling, opts.maxList);
+    printCorruptionTable(root, corrupt);
   }
-  const total = sN + lN + mN + dangling.length;
+  const total = sN + lN + mN + dangling.length + corrupt.length;
   if (total === 0) ok('clean — no overlapping ids in scanned pools');
   else warn(`${total} issue${total === 1 ? '' : 's'} — run \`node . fix\` to patch`);
 }
@@ -747,10 +789,16 @@ async function cmdScan(root, opts, config) {
 async function cmdFix(root, opts, config) {
   await assertDir(root);
   if (!opts.quiet) {
+    step('ver',   C.dim(`carcols-patcher v${VERSION} · engine ${process.argv[1] || 'index.js'}`));
     step('cfg',   config._path ? `read ${C.dim(path.basename(config._path))}` : C.dim('using defaults (no config.json)'));
     step('walk',  C.dim(root));
   }
   const idx = await buildIndex(root, opts.ignore);
+  const corrupt = detectCorruption(idx.files);
+  if (corrupt.length > 0 && !opts.quiet) {
+    step('xml', C.red(`${corrupt.length} corrupted file${corrupt.length === 1 ? '' : 's'}`));
+    printCorruptionTable(root, corrupt);
+  }
   const conflicts = detectConflicts(idx.pools, opts);
   const dangling = opts.modkit ? detectDanglingKitRefs(idx) : [];
   const danglingRepairs = dangling
