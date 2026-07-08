@@ -69,7 +69,8 @@ function run(args) {
   const argv = [engine, cmd, resourcesDir, ...passthru];
 
   const spawnWith = (bin, onFail) => {
-    log(`running: ${path.basename(bin)} index.js ${cmd} ${passthru.join(' ')}`.trim());
+    log(`running: ${path.basename(bin)} ${cmd} ${passthru.join(' ')}`.trim());
+    log(`engine: ${engine}`); // full path — a stale index.js copied into the resource shadows the repo one
     let child;
     try {
       child = cp.spawn(bin, argv, { env: { ...process.env, NO_COLOR: '1' } });
